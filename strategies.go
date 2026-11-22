@@ -30,31 +30,34 @@ func splitCSV(s string) []string {
 	return out
 }
 
-// buildStrategies returns the default order: cheap record-level changes first,
-// packet-level tricks (disorder, urgent byte, low-TTL fakes) after them.
+// buildStrategies returns the default order. It follows the first field probe
+// (MCI, Nov 2026): TLS record splitting and the urgent byte passed every
+// reachable host, plain and TCP splitting were reset, and the low-TTL decoys
+// were unreliable. Order only matters until a network has taught the store
+// something better; the store then reorders by what worked.
 func buildStrategies(decoys []string) []Strategy {
 	fake := func(ttl int) *desync.FakeOptions {
 		return &desync.FakeOptions{TTL: ttl, Prefix: -1, SNI: decoys, Randomize: true}
 	}
 	one := []desync.Pos{sni(1)}
 	return []Strategy{
-		{"plain", desync.Options{}},
 		{"tlsrec-1s", desync.Options{TLSRec: []desync.Pos{sni(1)}}},
 		{"tlsrec-m3s", desync.Options{TLSRec: []desync.Pos{sni(-3)}}},
+		{"oob-1s", desync.Options{Split: one, OOB: &desync.OOBOptions{}}},
+		{"tlsrec-split", desync.Options{TLSRec: []desync.Pos{sni(1)}, Split: one}},
 		{"tlsrec-multi", desync.Options{TLSRec: []desync.Pos{sni(-8), sni(1), sni(8)}}},
+		{"disoob-1s", desync.Options{Split: one, Disorder: true, OOB: &desync.OOBOptions{}}},
 		{"split-1s", desync.Options{Split: one}},
 		{"split-1s-wait", desync.Options{Split: one, SplitWait: desync.SplitWaitAcked, SplitWaitTimeout: time.Second}},
-		{"tlsrec-split", desync.Options{TLSRec: []desync.Pos{sni(1)}, Split: one}},
-		{"oob-1s", desync.Options{Split: one, OOB: &desync.OOBOptions{}}},
 		{"disorder-1s", desync.Options{Split: one, Disorder: true}},
-		{"disoob-1s", desync.Options{Split: one, Disorder: true, OOB: &desync.OOBOptions{}}},
-		{"fake-ttl5", desync.Options{Fake: fake(5)}},
+		{"plain", desync.Options{}},
 		{"fake-ttl3", desync.Options{Fake: fake(3)}},
+		{"disorder-fake5", desync.Options{Split: one, Disorder: true, Fake: fake(5)}},
+		{"fake-ttl5", desync.Options{Fake: fake(5)}},
 		{"fake-ttl8", desync.Options{Fake: fake(8)}},
 		{"fake-auto", desync.Options{Fake: &desync.FakeOptions{AutoTTL: &desync.AutoTTL{}, TTL: 5, Prefix: -1, SNI: decoys, Randomize: true}}},
 		{"tlsrec-fake5", desync.Options{TLSRec: []desync.Pos{sni(1)}, Fake: fake(5)}},
 		{"split-fake5", desync.Options{Split: one, Fake: fake(5)}},
-		{"disorder-fake5", desync.Options{Split: one, Disorder: true, Fake: fake(5)}},
 	}
 }
 
