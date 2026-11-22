@@ -1,0 +1,93 @@
+{
+  "__Credits__": {
+    "base": "Derived from patterniha's Serverless-for-Iran (fragA): same DNS/routing skeleton; the TLS fragment outbound is replaced by a SOCKS hop to the local Mahak engine"
+  },
+  "remarks": "Mahak-v0-fragA-base",
+  "version": { "min": "26.6.27" },
+  "log": { "loglevel": "warning", "dnsLog": false, "access": "none" },
+  "policy": {
+    "levels": {
+      "0": { "uplinkOnly": 0, "downlinkOnly": 0 },
+      "12": { "uplinkOnly": 0, "downlinkOnly": 0, "connIdle": 12 }
+    }
+  },
+  "dns": {
+    "servers": [
+      {
+        "address": "fakedns",
+        "domains": ["domain:ir", "geosite:private", "geosite:category-ir", "geosite:xai", "geosite:openai", "geosite:google-deepmind", "geosite:anthropic", "geosite:github", "geosite:microsoft", "geosite:golang", "geosite:python", "geosite:rust"]
+      },
+      {
+        "tag": "no-filter-dns",
+        "address": "https://cloudflare-dns.com/dns-query",
+        "timeoutMs": 12000,
+        "finalQuery": true
+      },
+      {
+        "address": "localhost",
+        "domains": ["domain:ir", "geosite:private", "geosite:category-ir", "geosite:xai", "geosite:openai", "geosite:google-deepmind", "geosite:anthropic", "geosite:github", "geosite:microsoft", "geosite:golang", "geosite:python", "geosite:rust"],
+        "finalQuery": true
+      }
+    ],
+    "queryStrategy": "UseSystem",
+    "useSystemHosts": true,
+    "serveStale": true
+  },
+  "inbounds": [
+    {
+      "tag": "mixed-in",
+      "port": 10808,
+      "protocol": "mixed",
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["fakedns", "tls", "http", "quic"],
+        "routeOnly": false
+      },
+      "settings": { "udp": true, "ip": "127.0.0.1" },
+      "streamSettings": { "sockopt": { "tcpKeepAliveInterval": 1, "tcpKeepAliveIdle": 11 } }
+    }
+  ],
+  "outbounds": [
+    { "tag": "block", "protocol": "block" },
+    {
+      "tag": "tcp-direct",
+      "protocol": "direct",
+      "streamSettings": {
+        "sockopt": {
+          "domainStrategy": "ForceIP",
+          "happyEyeballs": { "tryDelayMs": 300, "prioritizeIPv6": false, "interleave": 4, "maxConcurrentTry": 20 }
+        }
+      }
+    },
+    {
+      "tag": "udp-direct",
+      "protocol": "direct",
+      "streamSettings": { "sockopt": { "domainStrategy": "ForceIPv4v6" } }
+    },
+    { "tag": "dns-out", "protocol": "dns", "settings": { "userLevel": 12 } },
+    {
+      "tag": "mahak",
+      "protocol": "socks",
+      "settings": { "servers": [ { "address": "127.0.0.1", "port": 10850 } ] }
+    }
+  ],
+  "routing": {
+    "domainStrategy": "IPOnDemand",
+    "rules": [
+      { "outboundTag": "mahak", "inboundTag": ["no-filter-dns"] },
+      { "outboundTag": "dns-out", "port": 53 },
+      { "outboundTag": "tcp-direct", "network": "tcp", "domain": ["domain:ir", "geosite:private", "geosite:category-ir", "geosite:xai", "geosite:openai", "geosite:google-deepmind", "geosite:anthropic", "geosite:github", "geosite:microsoft", "geosite:golang", "geosite:python", "geosite:rust"] },
+      { "outboundTag": "udp-direct", "network": "udp", "domain": ["domain:ir", "geosite:private", "geosite:category-ir", "geosite:xai", "geosite:openai", "geosite:google-deepmind", "geosite:anthropic", "geosite:github", "geosite:microsoft", "geosite:golang", "geosite:python", "geosite:rust"] },
+      { "outboundTag": "block", "ip": ["10.10.34.0/24", "2001:4188:2:600::/64"] },
+      { "outboundTag": "tcp-direct", "network": "tcp", "ip": ["geoip:private", "geoip:ir"] },
+      { "outboundTag": "udp-direct", "network": "udp", "ip": ["geoip:private", "geoip:ir"] },
+      { "outboundTag": "block", "network": "udp", "protocol": ["quic"], "ip": ["0.0.0.0/0", "::/0"] },
+      { "outboundTag": "block", "network": "udp", "port": "443", "ip": ["0.0.0.0/0", "::/0"] },
+      { "outboundTag": "udp-direct", "network": "udp", "ip": ["0.0.0.0/0", "::/0"] },
+      { "outboundTag": "mahak", "network": "tcp", "protocol": ["tls"], "ip": ["0.0.0.0/0", "::/0"] },
+      { "outboundTag": "mahak", "network": "tcp", "port": "443", "ip": ["0.0.0.0/0", "::/0"] },
+      { "outboundTag": "tcp-direct", "network": "tcp", "ip": ["0.0.0.0/0", "::/0"] },
+      { "outboundTag": "block", "port": "0-65535" }
+    ]
+  }
+}
