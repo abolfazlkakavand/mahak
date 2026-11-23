@@ -1,9 +1,9 @@
 {
   "__Credits__": {
     "base": "Derived from patterniha's Serverless-for-Iran (fragA): same DNS/routing skeleton; the TLS fragment outbound is replaced by a SOCKS hop to the local Mahak engine",
-    "dns": "The h2c+one DoH address was found by testing on MCI: the TLS form of cloudflare-dns.com is cut by the SNI filter there"
+    "dns": "DoH stays https: Xray makes the TLS handshake itself and Mahak only carries it. An h2c address would send plain HTTP/2 to port 443 here, because nothing in this chain adds TLS"
   },
-  "remarks": "Mahak-v1",
+  "remarks": "Mahak-v2",
   "version": { "min": "26.6.27" },
   "log": { "loglevel": "warning", "dnsLog": false, "access": "none" },
   "policy": {
@@ -20,7 +20,7 @@
       },
       {
         "tag": "no-filter-dns",
-        "address": "h2c+one://cloudflare-dns.com/dns-query",
+        "address": "https://cloudflare-dns.com/dns-query",
         "timeoutMs": 12000,
         "finalQuery": true
       },
