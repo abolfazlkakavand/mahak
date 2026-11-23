@@ -71,27 +71,38 @@ func (r *Resolver) client(s dohServer) *http.Client {
 	return c
 }
 
+// Lookup returns the IPv4 addresses of host.
 func (r *Resolver) Lookup(ctx context.Context, host string) ([]net.IP, error) {
+	return r.lookup(ctx, host, false)
+}
+
+// LookupAll returns the IPv4 and, unless IPv6 is switched off, the IPv6 addresses of host.
+func (r *Resolver) LookupAll(ctx context.Context, host string) ([]net.IP, error) {
+	return r.lookup(ctx, host, true)
+}
+
+func (r *Resolver) lookup(ctx context.Context, host string, all bool) ([]net.IP, error) {
 	if ip := net.ParseIP(host); ip != nil {
 		return []net.IP{ip}, nil
 	}
 	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	key := host
+	if all {
+		key += "|all"
+	}
 	r.mu.Lock()
-	if ce, ok := r.cache[host]; ok && time.Now().Before(ce.exp) {
+	if ce, ok := r.cache[key]; ok && time.Now().Before(ce.exp) {
 		r.mu.Unlock()
 		return ce.ips, nil
 	}
 	r.mu.Unlock()
 
+	withV6 := all && r.e.ipv6 != "off"
 	var last error = errors.New("no DoH server configured")
 	for _, s := range r.servers {
-		ips, ttl, err := r.query(ctx, s, host)
+		ips, ttl, err := r.queryTypes(ctx, s, host, withV6)
 		if err != nil {
 			last = err
-			continue
-		}
-		if len(ips) == 0 {
-			last = errors.New("no A record")
 			continue
 		}
 		if ttl < 60 {
@@ -101,15 +112,58 @@ func (r *Resolver) Lookup(ctx context.Context, host string) ([]net.IP, error) {
 			ttl = 600
 		}
 		r.mu.Lock()
-		r.cache[host] = cacheEntry{ips: ips, exp: time.Now().Add(time.Duration(ttl) * time.Second)}
+		r.cache[key] = cacheEntry{ips: ips, exp: time.Now().Add(time.Duration(ttl) * time.Second)}
 		r.mu.Unlock()
 		return ips, nil
 	}
 	return nil, fmt.Errorf("doh lookup %s: %v", host, last)
 }
 
-func (r *Resolver) query(ctx context.Context, s dohServer, host string) ([]net.IP, uint32, error) {
-	q, err := buildQuery(host, 1)
+// queryTypes asks for A, and for AAAA as well when withV6 is set, at the same time.
+func (r *Resolver) queryTypes(ctx context.Context, s dohServer, host string, withV6 bool) ([]net.IP, uint32, error) {
+	types := []uint16{1}
+	if withV6 {
+		types = append(types, 28)
+	}
+	type result struct {
+		ips []net.IP
+		ttl uint32
+		err error
+	}
+	ch := make(chan result, len(types))
+	for _, t := range types {
+		go func(t uint16) {
+			ips, ttl, err := r.query(ctx, s, host, t)
+			ch <- result{ips, ttl, err}
+		}(t)
+	}
+	var all []net.IP
+	minTTL := uint32(600)
+	var firstErr error
+	for range types {
+		x := <-ch
+		if x.err != nil {
+			if firstErr == nil {
+				firstErr = x.err
+			}
+			continue
+		}
+		all = append(all, x.ips...)
+		if len(x.ips) > 0 && x.ttl < minTTL {
+			minTTL = x.ttl
+		}
+	}
+	if len(all) == 0 {
+		if firstErr != nil {
+			return nil, 0, firstErr
+		}
+		return nil, 0, errors.New("no address records")
+	}
+	return all, minTTL, nil
+}
+
+func (r *Resolver) query(ctx context.Context, s dohServer, host string, qtype uint16) ([]net.IP, uint32, error) {
+	q, err := buildQuery(host, qtype)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -174,6 +228,7 @@ func skipName(msg []byte, off int) (int, error) {
 	}
 }
 
+// parseAnswers returns the A and AAAA records of a DNS response and the lowest TTL among them.
 func parseAnswers(msg []byte) ([]net.IP, uint32, error) {
 	if len(msg) < 12 {
 		return nil, 0, errShort
@@ -207,8 +262,8 @@ func parseAnswers(msg []byte) ([]net.IP, uint32, error) {
 		if off+rl > len(msg) {
 			return nil, 0, errShort
 		}
-		if t == 1 && rl == 4 {
-			ips = append(ips, net.IP(append([]byte(nil), msg[off:off+4]...)))
+		if (t == 1 && rl == 4) || (t == 28 && rl == 16) {
+			ips = append(ips, net.IP(append([]byte(nil), msg[off:off+rl]...)))
 			if ttl < minTTL {
 				minTTL = ttl
 			}

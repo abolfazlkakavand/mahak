@@ -25,10 +25,20 @@ type Engine struct {
 	roots          *x509.CertPool
 	attemptTimeout time.Duration
 	dialTimeout    time.Duration
+	stagger        time.Duration
 	maxAttempts    int
+	ipv6           string
 	dns            *Resolver
 	verbose        bool
 }
+
+// dialErr marks a failure to open the TCP connection at all (timeout, refusal, no route). That says
+// something about the address, nothing about the strategy, so it neither counts against a strategy
+// nor is retried with the others.
+type dialErr struct{ err error }
+
+func (d *dialErr) Error() string { return "connect: " + d.err.Error() }
+func (d *dialErr) Unwrap() error { return d.err }
 
 func newEngine(cf *common) (*Engine, error) {
 	strategies := validStrategies(buildStrategies(splitCSV(cf.decoy)))
@@ -44,6 +54,10 @@ func newEngine(cf *common) (*Engine, error) {
 	if key == "" {
 		key = autoNetKey()
 	}
+	mode := strings.ToLower(cf.ipv6)
+	if mode != "first" && mode != "last" && mode != "off" {
+		mode = "first"
+	}
 	e := &Engine{
 		strategies:     strategies,
 		store:          loadStore(statePath),
@@ -51,7 +65,9 @@ func newEngine(cf *common) (*Engine, error) {
 		roots:          loadRoots(),
 		attemptTimeout: cf.attempt,
 		dialTimeout:    5 * time.Second,
+		stagger:        cf.stagger,
 		maxAttempts:    cf.maxAttempts,
+		ipv6:           mode,
 		verbose:        cf.verbose,
 	}
 	e.dns = newResolver(e, parseDoH(cf.doh))
@@ -102,6 +118,41 @@ func loadRoots() *x509.CertPool {
 	return pool
 }
 
+// orderIPs keeps at most two addresses per family and orders the families by the ipv6 mode.
+func orderIPs(ips []net.IP, mode string) []net.IP {
+	var v4, v6 []net.IP
+	for _, ip := range ips {
+		if ip.To4() != nil {
+			v4 = append(v4, ip)
+		} else {
+			v6 = append(v6, ip)
+		}
+	}
+	if len(v4) > 2 {
+		v4 = v4[:2]
+	}
+	if len(v6) > 2 {
+		v6 = v6[:2]
+	}
+	switch mode {
+	case "off":
+		return v4
+	case "last":
+		return append(v4, v6...)
+	}
+	return append(v6, v4...)
+}
+
+func family(addr string) string {
+	h, _, err := net.SplitHostPort(addr)
+	if err == nil {
+		if ip := net.ParseIP(h); ip != nil && ip.To4() == nil {
+			return "v6"
+		}
+	}
+	return "v4"
+}
+
 func (e *Engine) dialStrategy(ctx context.Context, addr string, st Strategy) (net.Conn, error) {
 	d := net.Dialer{Timeout: e.dialTimeout}
 	if st.Opts.Fake != nil && st.Opts.Fake.AutoTTL != nil {
@@ -109,7 +160,7 @@ func (e *Engine) dialStrategy(ctx context.Context, addr string, st Strategy) (ne
 	}
 	raw, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
-		return nil, err
+		return nil, &dialErr{err}
 	}
 	return desync.WrapConn(raw, st.Opts), nil
 }
@@ -150,9 +201,13 @@ func (e *Engine) dialTLSRotate(ctx context.Context, ip, port, serverName string)
 			e.logf("doh %s via %s", serverName, st.Name)
 			return tc, nil
 		}
+		last = err
+		var de *dialErr
+		if errors.As(err, &de) {
+			break
+		}
 		e.store.Fail(e.netKey, key, st.Name)
 		e.logf("doh %s via %s failed: %s", serverName, st.Name, classify(err))
-		last = err
 		if ctx.Err() != nil {
 			break
 		}
@@ -186,9 +241,86 @@ func (e *Engine) attempt(ctx context.Context, addr string, st Strategy, hello []
 	return c, hdr, nil
 }
 
-type try struct {
-	st Strategy
-	ip net.IP
+func resetTimer(t *time.Timer, d time.Duration) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+	t.Reset(d)
+}
+
+// joinErrs reports a dial failure only when every candidate failed to connect; otherwise it
+// returns the last error that was not a dial failure.
+func joinErrs(errs []error) error {
+	var de *dialErr
+	var last error
+	for _, err := range errs {
+		last = err
+	}
+	for i := len(errs) - 1; i >= 0; i-- {
+		if !errors.As(errs[i], &de) {
+			return errs[i]
+		}
+	}
+	return last
+}
+
+// race tries the candidate addresses with one strategy, the next one starting when the stagger time
+// has passed or the previous one has failed, and keeps the first that gets a TLS record back.
+// This is the same idea as the happy-eyeballs dialling of the Xray core, with "the server answered
+// the hello" as the definition of success.
+func (e *Engine) race(ctx context.Context, cands []string, st Strategy, hello []byte) (net.Conn, []byte, string, error) {
+	type result struct {
+		c    net.Conn
+		hdr  []byte
+		addr string
+		err  error
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	ch := make(chan result, len(cands))
+	launched, finished := 0, 0
+	launch := func() {
+		addr := cands[launched]
+		launched++
+		go func() {
+			c, hdr, err := e.attempt(ctx, addr, st, hello)
+			ch <- result{c, hdr, addr, err}
+		}()
+	}
+	launch()
+	timer := time.NewTimer(e.stagger)
+	defer timer.Stop()
+	var errs []error
+	for finished < launched {
+		select {
+		case r := <-ch:
+			finished++
+			if r.err == nil {
+				go func(pending int) {
+					for i := 0; i < pending; i++ {
+						if x := <-ch; x.c != nil {
+							x.c.Close()
+						}
+					}
+				}(launched - finished)
+				return r.c, r.hdr, r.addr, nil
+			}
+			errs = append(errs, r.err)
+			if launched < len(cands) {
+				launch()
+				resetTimer(timer, e.stagger)
+			}
+		case <-timer.C:
+			if launched < len(cands) {
+				launch()
+				timer.Reset(e.stagger)
+			}
+		}
+	}
+	return nil, nil, "", joinErrs(errs)
 }
 
 func (e *Engine) proxyTLS(ctx context.Context, client net.Conn, host string, port int, hello []byte, extra []byte) {
@@ -197,37 +329,44 @@ func (e *Engine) proxyTLS(ctx context.Context, client net.Conn, host string, por
 		key = strings.ToLower(h.SNI)
 	}
 	lctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	ips, err := e.dns.Lookup(lctx, host)
+	ips, err := e.dns.LookupAll(lctx, host)
 	cancel()
 	if err != nil || len(ips) == 0 {
-		e.logf("%s: %v", host, err)
+		log.Printf("%s: no address (%v)", key, err)
 		return
+	}
+	cands := orderIPs(ips, e.ipv6)
+	if len(cands) == 0 {
+		log.Printf("%s: no usable address", key)
+		return
+	}
+	p := strconv.Itoa(port)
+	addrs := make([]string, len(cands))
+	for i, ip := range cands {
+		addrs[i] = net.JoinHostPort(ip.String(), p)
 	}
 	order := e.store.Order(e.netKey, key, e.strategies)
 	if len(order) > e.maxAttempts {
 		order = order[:e.maxAttempts]
 	}
-	var plan []try
-	for _, st := range order {
-		plan = append(plan, try{st, ips[0]})
-	}
-	for i := 1; i < len(ips) && i < 3; i++ {
-		plan = append(plan, try{order[0], ips[i]})
-	}
-	p := strconv.Itoa(port)
-	for i, t := range plan {
+	for i, st := range order {
 		if ctx.Err() != nil {
 			return
 		}
 		start := time.Now()
-		up, hdr, err := e.attempt(ctx, net.JoinHostPort(t.ip.String(), p), t.st, hello)
+		up, hdr, addr, err := e.race(ctx, addrs, st, hello)
 		if err != nil {
-			e.store.Fail(e.netKey, key, t.st.Name)
-			e.logf("%s try %d %s: %s", key, i+1, t.st.Name, classify(err))
+			var de *dialErr
+			if errors.As(err, &de) {
+				log.Printf("%s: unreachable: %v", key, de.err)
+				return
+			}
+			e.store.Fail(e.netKey, key, st.Name)
+			e.logf("%s try %d %s: %s", key, i+1, st.Name, classify(err))
 			continue
 		}
-		e.store.Success(e.netKey, key, t.st.Name)
-		e.logf("%s ok via %s (%d ms)", key, t.st.Name, time.Since(start).Milliseconds())
+		e.store.Success(e.netKey, key, st.Name)
+		e.logf("%s ok via %s %s (%d ms)", key, st.Name, family(addr), time.Since(start).Milliseconds())
 		if _, err := client.Write(hdr); err != nil {
 			up.Close()
 			return
@@ -238,21 +377,31 @@ func (e *Engine) proxyTLS(ctx context.Context, client net.Conn, host string, por
 		relay(client, up)
 		return
 	}
-	e.logf("%s: all strategies failed", key)
+	log.Printf("%s: all strategies failed", key)
 }
 
 func (e *Engine) proxyPlain(ctx context.Context, client net.Conn, host string, port int, first []byte) {
 	lctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	ips, err := e.dns.Lookup(lctx, host)
+	ips, err := e.dns.LookupAll(lctx, host)
 	cancel()
 	if err != nil || len(ips) == 0 {
-		e.logf("%s: %v", host, err)
+		log.Printf("%s: no address (%v)", host, err)
+		return
+	}
+	cands := orderIPs(ips, e.ipv6)
+	if len(cands) == 0 {
 		return
 	}
 	d := net.Dialer{Timeout: e.dialTimeout}
-	up, err := d.DialContext(ctx, "tcp", net.JoinHostPort(ips[0].String(), strconv.Itoa(port)))
-	if err != nil {
-		e.logf("%s: %v", host, err)
+	var up net.Conn
+	for _, ip := range cands {
+		up, err = d.DialContext(ctx, "tcp", net.JoinHostPort(ip.String(), strconv.Itoa(port)))
+		if err == nil {
+			break
+		}
+	}
+	if up == nil {
+		log.Printf("%s: unreachable: %v", host, err)
 		return
 	}
 	if len(first) > 0 {

@@ -12,14 +12,16 @@ import (
 	"time"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 type common struct {
 	doh         string
 	decoy       string
 	state       string
 	netLabel    string
+	ipv6        string
 	attempt     time.Duration
+	stagger     time.Duration
 	maxAttempts int
 	verbose     bool
 }
@@ -30,7 +32,9 @@ func addCommon(fs *flag.FlagSet) *common {
 	fs.StringVar(&c.decoy, "decoy", "letsencrypt.org", "decoy SNI names for fake-packet strategies, comma separated")
 	fs.StringVar(&c.state, "state", "", "state file (default ~/.mahak/state.json)")
 	fs.StringVar(&c.netLabel, "net", "", "network label (default: derived from the local address)")
+	fs.StringVar(&c.ipv6, "ipv6", "first", "IPv6 use: first, last or off")
 	fs.DurationVar(&c.attempt, "attempt-timeout", 3500*time.Millisecond, "how long to wait for the server's first bytes per strategy")
+	fs.DurationVar(&c.stagger, "stagger", 300*time.Millisecond, "delay before the next address is tried in parallel")
 	fs.IntVar(&c.maxAttempts, "max-attempts", 6, "strategies tried per connection")
 	fs.BoolVar(&c.verbose, "v", false, "verbose log")
 	return c
@@ -42,6 +46,7 @@ func usage() {
 Usage:
   mahak serve [-listen 127.0.0.1:10808] [flags]   run the local SOCKS5 proxy
   mahak probe [-targets a.com,b.com] [flags]      test every strategy on this network
+  mahak speed [-url https://host/file] [flags]    measure download speed per strategy, IPv4 and IPv6
   mahak strategies                                list built-in strategies
   mahak version
 `, version)
@@ -57,6 +62,8 @@ func main() {
 		cmdServe(os.Args[2:])
 	case "probe":
 		cmdProbe(os.Args[2:])
+	case "speed":
+		cmdSpeed(os.Args[2:])
 	case "strategies":
 		for _, s := range validStrategies(buildStrategies(splitCSV("letsencrypt.org"))) {
 			fmt.Println(s.Name)
@@ -90,7 +97,7 @@ func cmdServe(args []string) {
 		ln.Close()
 	}()
 	e.store.StartAutoSave(ctx)
-	log.Printf("mahak %s listening on %s, net=%s, %d strategies", version, *listen, e.netKey, len(e.strategies))
+	log.Printf("mahak %s listening on %s, net=%s, %d strategies, ipv6=%s", version, *listen, e.netKey, len(e.strategies), e.ipv6)
 	for {
 		c, err := ln.Accept()
 		if err != nil {

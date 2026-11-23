@@ -33,20 +33,21 @@ func splitCSV(s string) []string {
 // buildStrategies returns the default order. It follows the first field probe
 // (MCI, Nov 2026): TLS record splitting and the urgent byte passed every
 // reachable host, plain and TCP splitting were reset, and the low-TTL decoys
-// were unreliable. Order only matters until a network has taught the store
-// something better; the store then reorders by what worked.
+// were unreliable. The urgent byte comes first because the Xray core's own OOB
+// mode, which is the one that runs fast on the same network, is built on it.
+// Order only matters until a network has taught the store something better.
 func buildStrategies(decoys []string) []Strategy {
 	fake := func(ttl int) *desync.FakeOptions {
 		return &desync.FakeOptions{TTL: ttl, Prefix: -1, SNI: decoys, Randomize: true}
 	}
 	one := []desync.Pos{sni(1)}
 	return []Strategy{
+		{"oob-1s", desync.Options{Split: one, OOB: &desync.OOBOptions{}}},
 		{"tlsrec-1s", desync.Options{TLSRec: []desync.Pos{sni(1)}}},
 		{"tlsrec-m3s", desync.Options{TLSRec: []desync.Pos{sni(-3)}}},
-		{"oob-1s", desync.Options{Split: one, OOB: &desync.OOBOptions{}}},
 		{"tlsrec-split", desync.Options{TLSRec: []desync.Pos{sni(1)}, Split: one}},
-		{"tlsrec-multi", desync.Options{TLSRec: []desync.Pos{sni(-8), sni(1), sni(8)}}},
 		{"disoob-1s", desync.Options{Split: one, Disorder: true, OOB: &desync.OOBOptions{}}},
+		{"tlsrec-multi", desync.Options{TLSRec: []desync.Pos{sni(-8), sni(1), sni(8)}}},
 		{"split-1s", desync.Options{Split: one}},
 		{"split-1s-wait", desync.Options{Split: one, SplitWait: desync.SplitWaitAcked, SplitWaitTimeout: time.Second}},
 		{"disorder-1s", desync.Options{Split: one, Disorder: true}},
