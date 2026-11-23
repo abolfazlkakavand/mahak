@@ -21,19 +21,27 @@ type hostStat struct {
 }
 
 type netStat struct {
-	Hosts  map[string]*hostStat `json:"hosts"`
-	Global map[string]*score    `json:"global"`
+	Hosts   map[string]*hostStat `json:"hosts"`
+	Global  map[string]*score    `json:"global"`
+	Speed   map[string]float64   `json:"speed,omitempty"`
+	CalibAt int64                `json:"calib_at,omitempty"`
 }
 
-// Store remembers, per network, which strategy worked for which host and how
-// often each strategy works overall. Mahak uses it to try the most likely
-// strategy first and to learn again when the network changes.
+// Store remembers, per network, which strategy worked for which host, how often each strategy
+// works overall, and how fast a connection is after each strategy and IP family (the numbers the
+// calibration measures). The first reason to keep speeds: on the first field test a strategy got
+// through the filter and then ran at 9 KB/s, so "passes" alone is not a good enough rule.
 type Store struct {
 	mu    sync.Mutex
 	path  string
 	Nets  map[string]*netStat `json:"nets"`
 	dirty bool
 }
+
+const (
+	slowKBps    = 40.0
+	neutralKBps = 300.0
+)
 
 func loadStore(path string) *Store {
 	s := &Store{path: path, Nets: map[string]*netStat{}}
@@ -52,7 +60,7 @@ func loadStore(path string) *Store {
 func (s *Store) net(key string) *netStat {
 	n := s.Nets[key]
 	if n == nil {
-		n = &netStat{Hosts: map[string]*hostStat{}, Global: map[string]*score{}}
+		n = &netStat{}
 		s.Nets[key] = n
 	}
 	if n.Hosts == nil {
@@ -60,6 +68,9 @@ func (s *Store) net(key string) *netStat {
 	}
 	if n.Global == nil {
 		n.Global = map[string]*score{}
+	}
+	if n.Speed == nil {
+		n.Speed = map[string]float64{}
 	}
 	return n
 }
@@ -72,10 +83,33 @@ func (n *netStat) rate(name string) float64 {
 	return float64(sc.OK+1) / float64(sc.OK+sc.Fail+2)
 }
 
-// Order returns all strategies, best guess first: the host's last working
-// strategy, then the rest by their success rate on this network (ties keep
-// the default order).
-func (s *Store) Order(netKey, host string, all []Strategy) []Strategy {
+func speedKey(fam, name string) string { return fam + "|" + name }
+
+// speedOf is the measured speed in KB/s, or a neutral guess when this strategy has not been measured.
+func (n *netStat) speedOf(fam, name string) float64 {
+	if v, ok := n.Speed[speedKey(fam, name)]; ok {
+		return v
+	}
+	return neutralKBps
+}
+
+// tier groups speeds so that measurement noise between two fast strategies does not reorder them.
+func tier(v float64) int {
+	switch {
+	case v < slowKBps:
+		return 0
+	case v < 400:
+		return 1
+	case v < 1000:
+		return 2
+	}
+	return 3
+}
+
+// Order returns all strategies, best guess first: the host's last working strategy (unless it is
+// known to be slow on this IP family), then the rest by speed tier on this family, then by how
+// often they get through (ties keep the default order).
+func (s *Store) Order(netKey, host, fam string, all []Strategy) []Strategy {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n := s.net(netKey)
@@ -83,7 +117,7 @@ func (s *Store) Order(netKey, host string, all []Strategy) []Strategy {
 	used := map[string]bool{}
 	if hs := n.Hosts[host]; hs != nil && hs.Best != "" {
 		for _, st := range all {
-			if st.Name == hs.Best {
+			if st.Name == hs.Best && n.speedOf(fam, st.Name) >= slowKBps {
 				out = append(out, st)
 				used[st.Name] = true
 			}
@@ -95,7 +129,13 @@ func (s *Store) Order(netKey, host string, all []Strategy) []Strategy {
 			rest = append(rest, st)
 		}
 	}
-	sort.SliceStable(rest, func(i, j int) bool { return n.rate(rest[i].Name) > n.rate(rest[j].Name) })
+	sort.SliceStable(rest, func(i, j int) bool {
+		ti, tj := tier(n.speedOf(fam, rest[i].Name)), tier(n.speedOf(fam, rest[j].Name))
+		if ti != tj {
+			return ti > tj
+		}
+		return n.rate(rest[i].Name) > n.rate(rest[j].Name)
+	})
 	return append(out, rest...)
 }
 
@@ -125,6 +165,34 @@ func (s *Store) Fail(netKey, host, name string) {
 		n.Global[name] = &score{}
 	}
 	n.Global[name].Fail++
+	s.dirty = true
+}
+
+func (s *Store) SetSpeed(netKey, fam, name string, kbps float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.net(netKey).Speed[speedKey(fam, name)] = kbps
+	s.dirty = true
+}
+
+func (s *Store) GetSpeed(netKey, fam, name string) (float64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v, ok := s.net(netKey).Speed[speedKey(fam, name)]
+	return v, ok
+}
+
+func (s *Store) NeedsCalibration(netKey string, maxAge time.Duration) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := s.net(netKey)
+	return n.CalibAt == 0 || time.Since(time.Unix(n.CalibAt, 0)) > maxAge
+}
+
+func (s *Store) MarkCalibrated(netKey string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.net(netKey).CalibAt = time.Now().Unix()
 	s.dirty = true
 }
 

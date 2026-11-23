@@ -14,35 +14,38 @@ import (
 
 // The handshake test of 'probe' says whether a strategy gets past the filter, not how fast the
 // connection is afterwards. 'speed' downloads a file with each strategy, over IPv4 and over IPv6,
-// because a flow can pass and still be slow.
+// because a flow can pass and still be slow. The same measurement drives the calibration.
 
 var defaultSpeedURLs = []string{
 	"https://speed.cloudflare.com/__down?bytes=8000000",
 	"https://proof.ovh.net/files/100Mb.dat",
 }
 
-func (e *Engine) speedOnce(ctx context.Context, host, path string, ip net.IP, st Strategy, secs time.Duration) string {
+// measure opens a connection with the strategy, downloads from host/path for up to secs seconds
+// (or maxBytes, when it is not zero) and returns the speed in KB/s. A non-empty second value says
+// why there is no speed.
+func (e *Engine) measure(ctx context.Context, host, path string, ip net.IP, st Strategy, secs time.Duration, maxBytes int64) (float64, string) {
 	tc, err := e.tlsAttempt(ctx, ip.String(), "443", host, st)
 	if err != nil {
-		return classify(err)
+		return 0, classify(err)
 	}
 	defer tc.Close()
 	_ = tc.SetDeadline(time.Now().Add(secs + 8*time.Second))
 	if _, err := fmt.Fprintf(tc, "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: mahak-speed\r\nAccept: */*\r\nConnection: close\r\n\r\n", path, host); err != nil {
-		return classify(err)
+		return 0, classify(err)
 	}
 	br := bufio.NewReaderSize(tc, 64<<10)
 	status, err := br.ReadString('\n')
 	if err != nil {
-		return classify(err)
+		return 0, classify(err)
 	}
 	if !strings.Contains(status, " 200") {
-		return "http " + strings.TrimSpace(strings.TrimPrefix(status, "HTTP/1.1"))
+		return 0, "http " + strings.TrimSpace(strings.TrimPrefix(status, "HTTP/1.1"))
 	}
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil {
-			return classify(err)
+			return 0, classify(err)
 		}
 		if line == "\r\n" || line == "\n" {
 			break
@@ -52,7 +55,7 @@ func (e *Engine) speedOnce(ctx context.Context, host, path string, ip net.IP, st
 	deadline := start.Add(secs)
 	var total int64
 	buf := make([]byte, 64<<10)
-	for time.Now().Before(deadline) {
+	for time.Now().Before(deadline) && (maxBytes == 0 || total < maxBytes) {
 		_ = tc.SetReadDeadline(deadline.Add(2 * time.Second))
 		n, err := br.Read(buf)
 		total += int64(n)
@@ -62,9 +65,17 @@ func (e *Engine) speedOnce(ctx context.Context, host, path string, ip net.IP, st
 	}
 	elapsed := time.Since(start).Seconds()
 	if total == 0 || elapsed <= 0 {
-		return "no data"
+		return 0, "no data"
 	}
-	return fmt.Sprintf("%.0f KB/s", float64(total)/1024/elapsed)
+	return float64(total) / 1024 / elapsed, ""
+}
+
+func (e *Engine) speedOnce(ctx context.Context, host, path string, ip net.IP, st Strategy, secs time.Duration) string {
+	kb, why := e.measure(ctx, host, path, ip, st, secs, 0)
+	if why != "" {
+		return why
+	}
+	return fmt.Sprintf("%.0f KB/s", kb)
 }
 
 func cmdSpeed(args []string) {
