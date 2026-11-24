@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 type common struct {
 	doh         string
@@ -35,7 +35,7 @@ func addCommon(fs *flag.FlagSet) *common {
 	fs.StringVar(&c.ipv6, "ipv6", "first", "IPv6 use: first, last or off")
 	fs.DurationVar(&c.attempt, "attempt-timeout", 3500*time.Millisecond, "how long to wait for the server's first bytes per strategy")
 	fs.DurationVar(&c.stagger, "stagger", 300*time.Millisecond, "delay before the next address is tried in parallel")
-	fs.IntVar(&c.maxAttempts, "max-attempts", 6, "strategies tried per connection")
+	fs.IntVar(&c.maxAttempts, "max-attempts", 8, "strategies tried per connection")
 	fs.BoolVar(&c.verbose, "v", false, "verbose log")
 	return c
 }
@@ -80,6 +80,7 @@ func cmdServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	cf := addCommon(fs)
 	listen := fs.String("listen", "127.0.0.1:10808", "SOCKS5 listen address")
+	calib := fs.Bool("calibrate", true, "measure strategy speeds on this network at start")
 	_ = fs.Parse(args)
 
 	e, err := newEngine(cf)
@@ -98,6 +99,9 @@ func cmdServe(args []string) {
 	}()
 	e.store.StartAutoSave(ctx)
 	log.Printf("mahak %s listening on %s, net=%s, %d strategies, ipv6=%s", version, *listen, e.netKey, len(e.strategies), e.ipv6)
+	if *calib {
+		go e.calibrate(ctx)
+	}
 	for {
 		c, err := ln.Accept()
 		if err != nil {

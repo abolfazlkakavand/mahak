@@ -166,7 +166,7 @@ func (e *Engine) dialStrategy(ctx context.Context, addr string, st Strategy) (ne
 }
 
 // tlsAttempt makes a full TLS handshake with one strategy. Used for the DoH
-// resolver and for probing.
+// resolver, for probing and for calibration.
 func (e *Engine) tlsAttempt(ctx context.Context, ip, port, serverName string, st Strategy) (*tls.Conn, error) {
 	c, err := e.dialStrategy(ctx, net.JoinHostPort(ip, port), st)
 	if err != nil {
@@ -189,7 +189,8 @@ func (e *Engine) tlsAttempt(ctx context.Context, ip, port, serverName string, st
 
 func (e *Engine) dialTLSRotate(ctx context.Context, ip, port, serverName string) (net.Conn, error) {
 	key := "tls:" + serverName
-	order := e.store.Order(e.netKey, key, e.strategies)
+	fam := family(net.JoinHostPort(ip, port))
+	order := e.store.Order(e.netKey, key, fam, e.strategies)
 	if len(order) > e.maxAttempts {
 		order = order[:e.maxAttempts]
 	}
@@ -345,7 +346,7 @@ func (e *Engine) proxyTLS(ctx context.Context, client net.Conn, host string, por
 	for i, ip := range cands {
 		addrs[i] = net.JoinHostPort(ip.String(), p)
 	}
-	order := e.store.Order(e.netKey, key, e.strategies)
+	order := e.store.Order(e.netKey, key, family(addrs[0]), e.strategies)
 	if len(order) > e.maxAttempts {
 		order = order[:e.maxAttempts]
 	}
@@ -354,7 +355,7 @@ func (e *Engine) proxyTLS(ctx context.Context, client net.Conn, host string, por
 			return
 		}
 		start := time.Now()
-		up, hdr, addr, err := e.race(ctx, addrs, st, hello)
+		up, hdr, addr, err := e.race(ctx, e.filterByFamily(st, addrs), st, hello)
 		if err != nil {
 			var de *dialErr
 			if errors.As(err, &de) {
